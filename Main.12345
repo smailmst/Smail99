@@ -1,0 +1,257 @@
+import ccxt
+import time
+import json
+import requests
+import os
+from datetime import datetime
+import pytz
+from threading import Thread
+import math
+
+# ===== إعدادات البورصة والتليجرام =====
+api_key = 'sE7jvHvqEDbBB7ctMPqingKmLC5AeM1iR3nUPatr03DwxkZT8pW8ltTEvtkWo6hy'
+api_secret = '6jsbp7bRfyqm98c4UIBq5oVIW8yrku7Q9s2SpEz39R1UEQz1CZtudZjysgpe45W6'
+binance = ccxt.binance({'apiKey': api_key, 'secret': api_secret, 'enableRateLimit': True})
+
+TOKEN = '7708635783:AAHnHSoPUV1AfhlpTDm3zOp795GkFi3xEHI'
+CHAT_ID = '6031049850'
+BASE_URL = f'https://api.telegram.org/bot{TOKEN}'
+tz = pytz.timezone('Africa/Algiers')
+
+OPEN_FILE = 'open_trades.json'
+CLOSED_FILE = 'closed_trades.json'
+
+# ===== أدوات مساعدة =====
+def load_json(file):
+    if not os.path.exists(file):
+        return []
+    with open(file, 'r') as f:
+        content = f.read().strip()
+        if not content:
+            return []
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return []
+
+def save_json(file, data):
+    with open(file, 'w') as f: json.dump(data, f, indent=2)
+
+open_trades = load_json(OPEN_FILE)
+closed_trades = load_json(CLOSED_FILE)
+
+def send(msg, reply_markup=None):
+    data = {'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}
+    if reply_markup:
+        data['reply_markup'] = json.dumps(reply_markup)
+    requests.post(f'{BASE_URL}/sendMessage', data=data)
+
+def send_keyboard():
+    keyboard = {
+        "keyboard": [[
+            {"text": "📊 الصفقات المفتوحة"},
+            {"text": "📈 الإحصائيات"},
+            {"text": "📉 نسبة الصفقات"}
+        ]],
+        "resize_keyboard": True
+    }
+    send('🧭 اختر من القائمة:', reply_markup=keyboard)
+
+def now():
+    return datetime.now(tz).strftime('%Y-%m-%d %H:%M')
+
+# ===== متابعة الحالات =====
+def handle_updates():
+    last_id = None
+    while True:
+        try:
+            res = requests.get(f"{BASE_URL}/getUpdates?offset={(last_id or 0)+1}&timeout=3").json()
+            for upd in res.get("result", []):
+                last_id = upd['update_id']
+                msg = upd.get("message", {}).get("text", "")
+                if not msg: continue
+
+                if msg == "📊 الصفقات المفتوحة":
+                    if not open_trades:
+                        send("❌ لا توجد صفقات مفتوحة حاليًا.")
+                    else:
+                        for t in open_trades:
+                            send(f"""🔄 صفقة مفتوحة
+
+📌 العملة: {t['symbol']}
+💰 سعر الدخول: {t['entry']}
+🎯 الهدف: {t['target']}
+🛑 الستوب: {t['stop']}
+🕒 وقت الدخول: {t['time']}
+""")
+                elif msg == "📈 الإحصائيات":
+                    today = datetime.now(tz).strftime('%Y-%m-%d')
+                    stats = ""
+                    for t in closed_trades:
+                        if today in t['time']:
+                            if t.get("result") == "target":
+                                stats += f"{t['symbol']} 🟢 ربح +1.25%\n"
+                            elif t.get("result") == "stop":
+                                stats += f"{t['symbol']} 🔴 خسارة -5%\n"
+                    send(f"📈 إحصائيات اليوم {today}:\n\n{stats}" if stats else "❌ لا توجد صفقات مغلقة اليوم.")
+                elif msg == "📉 نسبة الصفقات":
+                    tickers = binance.fetch_tickers()
+                    for t in open_trades:
+                        symbol = t['symbol']
+                        price = tickers[symbol].get('last')
+                        if price:
+                            change = round((price - t['entry']) / t['entry'] * 100, 2)
+                            sign = "📈" if change > 0 else "📉"
+                            send(f"{symbol} نسبة التغير: {change}% {sign}")
+        except Exception as e:
+            print("Update error:", e)
+        time.sleep(0.8)
+
+# ===== التحقق من تحقق الهدف أو الستوب =====
+def check_trade_status(trade):
+    try:
+        symbol = trade.get('symbol')
+        entry = trade.get('entry')
+        target = trade.get('target')
+        stop = trade.get('stop')
+        if not all([symbol, entry, target, stop]):
+            return None
+        entry_time = datetime.strptime(trade['time'], '%Y-%m-%d %H:%M')
+        entry_time = tz.localize(entry_time)
+        since = int(entry_time.timestamp() * 1000)
+        ohlcv = binance.fetch_ohlcv(symbol, '1m', since=since)
+        for candle in ohlcv:
+            high = candle[2]
+            low = candle[3]
+            if high >= target:
+                return 'target'
+            if low <= stop:
+                return 'stop'
+    except Exception as e:
+        print("Check error:", e)
+    return None
+
+def monitor_trades():
+    global open_trades, closed_trades, last_sold_candle
+    while True:
+        updated = []
+        for trade in open_trades:
+            result = check_trade_status(trade)
+            if result:
+                entry_time = tz.localize(datetime.strptime(trade['time'], '%Y-%m-%d %H:%M'))
+                duration = round((datetime.now(tz) - entry_time).total_seconds() / 60)
+
+                if result == 'target':
+                    msg = f"✅ الصفقة حققت الهدف!\n\n📌 العملة: {trade['symbol']}\n📈 الربح: +1.25% 🟢\n⏰ المدة: {duration} دقيقة"
+                else:
+                    msg = f"🛑 الصفقة ضربت الستوب!\n\n📌 العملة: {trade['symbol']}\n📉 الخسارة: -5% 🔴\n⏰ المدة: {duration} دقيقة"
+
+                send(msg)
+
+                trade["result"] = result
+                closed_trades.append(trade)
+            else:
+                updated.append(trade)
+
+        open_trades = updated
+        save_json(OPEN_FILE, open_trades)
+        save_json(CLOSED_FILE, closed_trades)
+        time.sleep(2)
+
+# ===== متابعة الشموع وتحليل الفرص =====
+last_bought_candle = {}
+last_sold_candle = {}
+last_open_price = {}
+highest_change = {}
+
+def analyze_symbol(symbol):
+    try:
+        ohlcv = binance.fetch_ohlcv(symbol, '15m', limit=2)
+        if len(ohlcv) < 2:
+            return
+
+        prev_candle = ohlcv[-2]
+        last_candle = ohlcv[-1]
+
+        candle_timestamp = last_candle[0]
+        open_price = last_candle[1]
+        last_price = last_candle[4]
+
+        prev_open = prev_candle[1]
+        prev_close = prev_candle[4]
+        prev_change = (prev_close - prev_open) / prev_open * 100
+
+        if prev_change > 3:
+            return
+
+        if symbol not in last_open_price or last_open_price[symbol]['timestamp'] != candle_timestamp:
+            last_open_price[symbol] = {'timestamp': candle_timestamp, 'open': open_price}
+            highest_change[symbol] = -999
+
+        open_price_fixed = last_open_price[symbol]['open']
+        change = (last_price - open_price_fixed) / open_price_fixed * 100
+
+        if change > highest_change[symbol]:
+            highest_change[symbol] = change
+
+        if 3.80 <= change < 3.95 and change >= highest_change[symbol] - 0.05:
+            if (symbol in last_bought_candle and last_bought_candle[symbol] == candle_timestamp) \
+               or (symbol in last_sold_candle and last_sold_candle[symbol] == candle_timestamp):
+                return
+
+            last_bought_candle[symbol] = candle_timestamp
+
+            target_price = round(last_price * 1.0125, 6)
+            stop_price = round(last_price * 0.95, 6)
+
+            send(f"🔔 شرط الشراء تحقق لـ {symbol} بارتفاع {change:.2f}%\n🎯 هدف: {target_price}\n🛑 ستوب: {stop_price}")
+
+            new_trade = {
+                "symbol": symbol,
+                "entry": last_price,
+                "target": target_price,
+                "stop": stop_price,
+                "time": now(),
+                "result": None
+            }
+            open_trades.append(new_trade)
+            save_json(OPEN_FILE, open_trades)
+
+    except Exception as e:
+        print(f"Error analyzing {symbol}: {e}")
+
+def scan():
+    global open_trades
+    while True:
+        try:
+            tickers = binance.fetch_tickers()
+            active_symbols = []
+            for symbol, data in tickers.items():
+                if not symbol.endswith('/USDT'):
+                    continue
+                change_24h = data.get('percentage', 0)
+                if change_24h is None or change_24h < -0.5:
+                    continue
+                vol = data.get('quoteVolume', 0)
+                if vol < 600_000:
+                    continue
+                active_symbols.append(symbol)
+
+            threads = []
+            for symbol in active_symbols:
+                t = Thread(target=analyze_symbol, args=(symbol,))
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
+        except Exception as e:
+            print("Scan error:", e)
+        time.sleep(2)
+
+# ===== تشغيل البوت =====
+send("✅ تم تشغيل البوت (وضع تجريبي بدون شراء/بيع).")
+send_keyboard()
+
+Thread(target=scan).start()
+Thread(target=handle_updates).start()
+Thread(target=monitor_trades).start()
